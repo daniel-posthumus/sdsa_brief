@@ -136,7 +136,11 @@ s_cbo.rename(columns={"value": "s (cbo baseline)"}, inplace=True)
 b_cbo = _read_cbo_budget_row("Table 1-3", "As a percentage of GDP", occurrence=0)
 b_cbo.rename(columns={"value": "b (cbo baseline)"}, inplace=True)
 
-cbo_budget = s_cbo.merge(b_cbo, on="year")
+# Net interest ($bn) from Table 1-2 — first occurrence (billions); used for r_av0 in script 03
+ni_cbo = _read_cbo_budget_row("Table 1-2", "Net interest", occurrence=0)
+ni_cbo.rename(columns={"value": "net interest bn (cbo)"}, inplace=True)
+
+cbo_budget = s_cbo.merge(b_cbo, on="year").merge(ni_cbo, on="year")
 cbo_budget['date'] = pd.to_datetime(cbo_budget['year'].astype(str) + '-01-01')
 master = pd.merge(cbo_econ, cbo_budget, on='date', how='left')
 
@@ -169,22 +173,32 @@ master.to_csv(clean_data / 'master_projections_cleaned.csv', index=False)
 # scale the (user - baseline) deltas of the 0.5pp scenario by 2× and add them
 # back to the Feb 2026 baseline.
 
-def _scenario_from_components(years, g_pct, d_rev, d_mand, d_disc, ngdp_user, label):
+def _scenario_from_components(years, delta_g_pct, d_rev, d_mand, d_disc, ngdp_user, label):
     # Change in primary surplus ($bn) = Δrevenues − Δnon-interest outlays.
     # As decimal of GDP (positive = improvement to surplus).
     delta_s_primary = (d_rev - d_mand - d_disc) / ngdp_user
     return pd.DataFrame({
         'year': years,
         'label': label,
-        'a_ug_ai': g_pct / 100.0,           # decimal real GDP growth
+        # decimal real GDP growth, change vs the Feb 2026 CBO calendar-year baseline. Script 03
+        # adds this to its own baseline a_ug, so the scenario differs from baseline only by the
+        # tool's productivity effect (not by the calendar-year vs quarterly construct).
+        'delta_g': delta_g_pct / 100.0,
         'delta_s_primary': delta_s_primary, # decimal of GDP, surplus-positive
     })
 
-def extract_ai_scenario_csv(path: Path, label: str) -> pd.DataFrame:
-    df = pd.read_csv(path, comment='#')
+def _merge_baseline(df: pd.DataFrame, baseline: pd.DataFrame) -> pd.DataFrame:
+    df = df.merge(baseline, on='year', how='left')
+    if df['baseline_ngdp_cal_bn'].isna().any() or df['baseline_g_pct'].isna().any():
+        missing = df.loc[df['baseline_ngdp_cal_bn'].isna() | df['baseline_g_pct'].isna(), 'year'].tolist()
+        raise ValueError(f"Missing Feb 2026 baseline rows for years: {missing}")
+    return df
+
+def extract_ai_scenario_csv(path: Path, label: str, baseline: pd.DataFrame) -> pd.DataFrame:
+    df = _merge_baseline(pd.read_csv(path, comment='#'), baseline)
     return _scenario_from_components(
         years=df['year'].astype(int).values,
-        g_pct=df['real_gdp_growth_user_pct'].values,
+        delta_g_pct=(df['real_gdp_growth_user_pct'] - df['baseline_g_pct']).values,
         d_rev=df['delta_revenues_bn'].values,
         d_mand=df['delta_mandatory_bn'].values,
         d_disc=df['delta_disc_bn'].values,
@@ -225,17 +239,14 @@ def derive_10pp_from_05pp(df_05: pd.DataFrame, baseline: pd.DataFrame) -> pd.Dat
     """Scale (user - baseline) deltas of the 0.5pp scenario by 2× to construct the
     1.0pp scenario, using the Feb 2026 baseline. Approximation: see comment block
     above (within ~2.5% of the workbook formulas over a 10-yr horizon)."""
-    df = df_05.merge(baseline, on='year', how='left')
-    if df['baseline_ngdp_cal_bn'].isna().any() or df['baseline_g_pct'].isna().any():
-        missing = df.loc[df['baseline_ngdp_cal_bn'].isna() | df['baseline_g_pct'].isna(), 'year'].tolist()
-        raise ValueError(f"Missing Feb 2026 baseline rows for years: {missing}")
-    g_pct_10  = df['baseline_g_pct'] + 2.0 * (df['real_gdp_growth_user_pct'] - df['baseline_g_pct'])
+    df = _merge_baseline(df_05, baseline)
+    dg_pct_10 = 2.0 * (df['real_gdp_growth_user_pct'] - df['baseline_g_pct'])
     ngdp_10   = df['baseline_ngdp_cal_bn'] + 2.0 * (df['nominal_gdp_user_bn'] - df['baseline_ngdp_cal_bn'])
     drev_10   = 2.0 * df['delta_revenues_bn']
     dmand_10  = 2.0 * df['delta_mandatory_bn']
     ddisc_10  = 2.0 * df['delta_disc_bn']
     return _scenario_from_components(
-        years=df['year'].values, g_pct=g_pct_10.values,
+        years=df['year'].values, delta_g_pct=dg_pct_10.values,
         d_rev=drev_10.values, d_mand=dmand_10.values, d_disc=ddisc_10.values,
         ngdp_user=ngdp_10.values, label='10pp',
     )
@@ -249,12 +260,12 @@ if '05pp' not in scenario_files:
         f"Transcribe from CBO publication 61914 with inputs1=0,.1,.2,.3,.4,.5,.5,.5,.5,.5,.5."
     )
 
-ai_frames = [extract_ai_scenario_csv(p, label) for label, p in scenario_files.items()]
+baseline_econ = _read_cbo_econ_calendar_baseline()
+ai_frames = [extract_ai_scenario_csv(p, label, baseline_econ) for label, p in scenario_files.items()]
 
 # Auto-derive the 1.0pp scenario from the 0.5pp web-tool output (Feb 2026 baseline).
 if '10pp' not in scenario_files:
     df_05_raw = pd.read_csv(scenario_files['05pp'], comment='#')
-    baseline_econ = _read_cbo_econ_calendar_baseline()
     ai_frames.append(derive_10pp_from_05pp(df_05_raw, baseline_econ))
     print("Synthesized '10pp' AI scenario from '05pp' via 2× linearity scaling "
           "against Feb 2026 calendar-year baseline.")

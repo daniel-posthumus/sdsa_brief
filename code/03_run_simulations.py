@@ -137,60 +137,59 @@ a_s_df = (master_proj[proj_mask].groupby('year')['s (cbo baseline)']
           .mean().reset_index())
 a_s = (a_s_df['s (cbo baseline)'].values) / 100.0
 
-debt_hist = get_fred_series('FYGFGDQ188S', 'debt_pct_gdp')
-debt_hist = debt_hist[debt_hist['date'] >= f'{HIST_START}-01-01'].copy()
-debt_hist['b_hist'] = debt_hist['debt_pct_gdp'] / 100.0
-debt_hist = debt_hist[debt_hist['date'].dt.month == 10].copy()
-debt_hist['calendar_year'] = debt_hist['date'].dt.year
-debt_hist = debt_hist[(debt_hist['calendar_year'] >= HIST_START) &
-                      (debt_hist['calendar_year'] <= HIST_END)][['calendar_year', 'b_hist']].dropna()
+debt_raw = get_fred_series('FYGFGDQ188S', 'debt_pct_gdp')
+debt_raw = debt_raw[debt_raw['date'].dt.month == 10].sort_values('date').copy()   # Q4 values
+debt_raw['calendar_year'] = debt_raw['date'].dt.year
+debt_raw['b_hist'] = debt_raw['debt_pct_gdp'] / 100.0
+debt_raw['b_hist_lag'] = debt_raw['b_hist'].shift(1)                              # prior year's Q4
+debt_hist = debt_raw[(debt_raw['calendar_year'] >= HIST_START) &
+                     (debt_raw['calendar_year'] <= HIST_END)][['calendar_year', 'b_hist']].dropna()
 
 # Initial debt level (start of simulation): most recent observed Q4 debt-to-GDP ratio.
 b0 = float(debt_hist.loc[debt_hist['calendar_year'] == HIST_END, 'b_hist'].iloc[0])
 
-# Initial average effective REAL rate on existing debt at sim start.
-# Nominal rate: annualized net federal interest (interest paid - interest received)
-#               / debt held by public.
-# Deflator:    10-year breakeven inflation (T10YIE), the market-implied expected inflation
-#              over the next 10 years. We use this rather than realized GDPDEF YoY because
-#              r_av is the rate paid on a portfolio of mostly multi-year debt, so the
-#              relevant inflation horizon is forward-looking and long-term, not last quarter's
-#              realized print.
-int_paid     = get_fred_series('A091RC1Q027SBEA', 'int_paid')      # SAAR, $bn, quarterly
-int_received = get_fred_series('B094RC1Q027SBEA', 'int_received')  # SAAR, $bn, quarterly
-debt_dollars = get_fred_series('FYGFDPUN', 'debt_mln')             # end-of-month, $mn
-breakeven    = get_fred_series('T10YIE', 'breakeven')              # 10y breakeven, daily, %
+# Historical average effective NOMINAL rate on debt held by the public (CBO budget basis,
+# fiscal years): i_t = net interest_t / debt held by the public_{t-1}, since interest in
+# year t accrues on b_{t-1} in the debt equation. 1999-2024 from CBO historical data;
+# 2025 net interest from the Feb 2026 outlook (actual).
+fisc = (pd.read_excel(raw_data / 'r_g_historic_data.xlsx', sheet_name='master')
+          .rename(columns={'interest payment (billions)': 'net_int_bn',
+                           'debt held by public (billions)': 'debt_bn'})
+          .set_index('year')[['net_int_bn', 'debt_bn']])
+if HIST_END not in fisc.index:
+    fisc.loc[HIST_END, 'net_int_bn'] = master_proj.loc[master_proj['year'] == HIST_END,
+                                                       'net interest bn (cbo)'].dropna().iloc[0]
+fisc = fisc.sort_index()
+fisc['i_eff'] = fisc['net_int_bn'] / fisc['debt_bn'].shift(1)
 
-for d in (int_paid, int_received, debt_dollars, breakeven):
-    d['date'] = d['date'].dt.to_period('Q').dt.to_timestamp()
-debt_dollars = debt_dollars.groupby('date', as_index=False)['debt_mln'].last()
-breakeven    = breakeven.groupby('date', as_index=False)['breakeven'].mean()
+# Initial average effective REAL rate on existing debt at sim start: the 2025 effective
+# nominal rate deflated by 10-year breakeven inflation (T10YIE, 2025 average), the
+# market-implied expected inflation over the next 10 years. We use this rather than realized
+# inflation because r_av is the rate paid on a portfolio of mostly multi-year debt, so the
+# relevant inflation horizon is forward-looking and long-term.
+breakeven = get_fred_series('T10YIE', 'breakeven')              # 10y breakeven, daily, %
+breakeven_hist_end = breakeven.loc[breakeven['date'].dt.year == HIST_END, 'breakeven'].mean() / 100.0
+r_av0 = float(fisc.loc[HIST_END, 'i_eff'] - breakeven_hist_end)
 
-rav_df = (int_paid.merge(int_received, on='date')
-                  .merge(debt_dollars, on='date')
-                  .merge(breakeven, on='date'))
-rav_df['nominal_rate'] = (rav_df['int_paid'] - rav_df['int_received']) / (rav_df['debt_mln'] / 1000.0)
-rav_df['expected_infl'] = rav_df['breakeven'] / 100.0
-rav_df = rav_df.dropna()
-
-target_year_obs = rav_df[rav_df['date'].dt.year == HIST_END]
-if target_year_obs.empty:
-    target_year_obs = rav_df.tail(4)  # fall back: last 4 quarters
-r_av0 = float((target_year_obs['nominal_rate'] - target_year_obs['expected_infl']).mean())
-
-growth = get_fred_series('A191RL1Q225SBEA', 'gdp_growth_rate') # quarterly, percent (real)
-interest = get_fred_series('REAINTRATREARAT10Y', 'interest_rate') # monthly, percent (real)
-snowball_hist = growth.merge(interest, on='date', how='outer')
-snowball_hist = snowball_hist[snowball_hist['date'].dt.month == 10].copy()
-snowball_hist['calendar_year'] = snowball_hist['date'].dt.year
-snowball_hist = snowball_hist[(snowball_hist['calendar_year'] >= HIST_START) &
-                                (snowball_hist['calendar_year'] <= HIST_END)].copy()
-snowball_hist = debt_hist.merge(snowball_hist, on='calendar_year', how='left')
-# Note: historical r-g uses the market 10yr real rate as a proxy since historical r_av is not observed
+# Historical interest-growth terms (annual), on the same concepts as the projections:
+#   r^av : effective real rate on debt = i_eff - realized GDP-deflator inflation
+#   g    : annual real GDP growth
+#   snowball = ((r^av - g) / (1 + g)) * b_{t-1}
+growth = get_fred_series('A191RL1A225NBEA', 'gdp_growth_rate')  # annual, percent (real)
+growth['calendar_year'] = growth['date'].dt.year
+gdpdef = get_fred_series('GDPDEF', 'gdpdef')                    # quarterly index
+gdpdef = gdpdef.groupby(gdpdef['date'].dt.year)['gdpdef'].mean().pct_change() * 100.0
+interest = pd.DataFrame({'calendar_year': fisc.index.astype(int),
+                         'interest_rate': (100.0 * fisc['i_eff']
+                                           - gdpdef.reindex(fisc.index).values).values})  # percent (real)
+snowball_hist = (debt_hist
+                 .merge(debt_raw[['calendar_year', 'b_hist_lag']], on='calendar_year', how='left')
+                 .merge(growth[['calendar_year', 'gdp_growth_rate']], on='calendar_year', how='left')
+                 .merge(interest, on='calendar_year', how='left'))
 snowball_hist['rg_hist'] = (snowball_hist['interest_rate'] - snowball_hist['gdp_growth_rate']) / 100.0
 snowball_hist['snowball'] = ((snowball_hist['interest_rate'] - snowball_hist['gdp_growth_rate']) / 100.0
                              / (1.0 + snowball_hist['gdp_growth_rate'] / 100.0)
-                             * snowball_hist['b_hist'])
+                             * snowball_hist['b_hist_lag'])
 
 # -------------------------------------------------
 # Core simulator (CBO-baseline r with debt feedback)
@@ -327,12 +326,6 @@ n_years = len(a_ug)
 n_sims  = 20000
 SIM_SEED = 42  # passed into simulate_scenario; see seeding logic there
 
-# stochastic vols
-s_g = 0.005
-s_x = 0.002
-s_r = 0.005
-s_s = 0.010
-
 # smoothing / persistence
 sigma = 0.80   # pass-through to r_av
 
@@ -341,6 +334,30 @@ _calib = pd.read_csv(clean_data / 'term_premium_calibration.csv').set_index('par
 beta_r = float(_calib['beta_r'])
 rho    = float(_calib['rho'])
 beta_r_dict = {f'{beta_r*100:.2f} bps': beta_r}
+
+# stochastic vols: calibrated so the model's year-on-year variation in g, s, and r matches
+# history (annual changes, 1984-2024, excluding 2020-2022, which are dominated by COVID-19).
+#   g: Δg_t = e^x_t + e^g_t - e^g_{t-1}          -> Var(Δg) = s_x^2 + 2 s_g^2
+#   s: Δs_t ≈ e^s_t - e^s_{t-1}  (c = 0)          -> Var(Δs) = 2 s_s^2
+#   r: Δz_t ≈ ρ Δz_{t-1} + e^r_t - e^r_{t-1}      -> Var(Δr) = 2 s_r^2 / (1 + ρ)
+# s_x (persistent growth shock) is not separately identified from annual changes, so it is fixed.
+CAL_START, CAL_END, CAL_EXCLUDE = 1984, 2024, [2020, 2021, 2022]
+
+def _hist_change_sd(series_by_year):
+    changes = series_by_year.sort_index().loc[CAL_START:CAL_END].diff()
+    return float(changes.drop(CAL_EXCLUDE, errors='ignore').std())
+
+g_by_year = growth.set_index('calendar_year')['gdp_growth_rate'] / 100.0
+s_by_year = (pd.read_excel(raw_data / 'r_g_historic_data.xlsx', sheet_name='master')
+               .set_index('year')['primary balance (pct of GDP)'] / 100.0)
+r10 = get_fred_series('REAINTRATREARAT10Y', 'r10')   # 10y real rate, monthly, percent
+r_by_year = r10.groupby(r10['date'].dt.year)['r10'].mean() / 100.0
+
+s_x = 0.002
+s_g = np.sqrt((_hist_change_sd(g_by_year) ** 2 - s_x ** 2) / 2.0)
+s_s = _hist_change_sd(s_by_year) / np.sqrt(2.0)
+s_r = _hist_change_sd(r_by_year) * np.sqrt((1.0 + rho) / 2.0)
+print(f"Calibrated shock SDs: s_g={s_g:.4f}, s_x={s_x:.4f}, s_r={s_r:.4f}, s_s={s_s:.4f}")
 
 # fiscal reaction regimes (only enrichment runs)
 d_dict = {
@@ -963,7 +980,7 @@ plot_primary_balance_story_popouts(
 years = np.arange(PROJ_START, PROJ_END + 1)
 
 # AI scenarios are produced by script 01 from CBO user-specified-projections workbooks.
-# Each row is one (scenario, year): a_ug_ai = real GDP growth (decimal),
+# Each row is one (scenario, year): delta_g = real GDP growth delta vs CBO baseline (decimal),
 # delta_s_primary = primary-surplus delta vs CBO baseline (decimal of GDP, surplus-positive).
 ai_scen = pd.read_csv(clean_data / 'ai_scenarios.csv')
 ai_scen = ai_scen[(ai_scen['year'] >= PROJ_START) & (ai_scen['year'] <= PROJ_END)]
@@ -984,7 +1001,7 @@ for label, sub in ai_scen.groupby('label'):
         continue
     pretty = ai_label_map.get(label, f"AI Boom ({label})")
     ai_scenarios[pretty] = {
-        "a_ug": sub['a_ug_ai'].values,
+        "a_ug": a_ug + sub['delta_g'].values,            # tool's growth effect on our baseline
         "a_s":  a_s + sub['delta_s_primary'].values,  # surplus-positive addition
     }
 

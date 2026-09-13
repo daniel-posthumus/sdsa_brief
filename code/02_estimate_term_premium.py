@@ -6,7 +6,7 @@ from fredapi import Fred
 from pathlib import Path
 import statsmodels.api as sm
 from statsmodels.iolib.summary2 import summary_col
-from scipy import stats                #  for the critical t-value
+from scipy import stats, optimize      #  critical t-value; restricted NLS
 
 work_dir = Path(__file__).resolve().parent.parent
 raw_data = work_dir / 'data' / 'raw'
@@ -403,28 +403,24 @@ potential_gdp = get_fred_series('GDPPOT', 'potential_gdp')
 print(f"Potential GDP data from {potential_gdp['date'].min()} to {potential_gdp['date'].max()}")
 debt = get_fred_series('FYGFGDQ188S', 'debt_gdp')
 print(f"Debt-to-GDP data from {debt['date'].min()} to {debt['date'].max()}")
-# nominal GDP for primary surplus calculation
+# nominal GDP for primary surplus calculation (SAAR, $bn)
 ngdp = get_fred_series('GDP', 'nominal_gdp')
-ngdp['nominal_gdp'] = ngdp['nominal_gdp'] * 1000
 print(f"Nominal GDP data from {ngdp['date'].min()} to {ngdp['date'].max()}")
 
-# bring in primary surplus data (bea)
-primary = pd.read_csv(raw_data / 'primary_surplus_bea.csv')
-# create datetime variable; right now, quarter looks like: '1947q1'
-quarter_map = {
-    'q1': '-01-01',
-    'q2': '-04-01',
-    'q3': '-07-01',
-    'q4': '-10-01'
-}
-primary['date'] = primary['quarter'].str.lower().replace(quarter_map, regex=True)
-primary['date'] = pd.to_datetime(primary['date'])
-primary = primary[['date', 'primary_surplus']]
-# drop missing primary_surplus 
-primary['primary_surplus'] = primary['primary_surplus'].astype(str).str.replace(',', '')
-primary['primary_surplus'] = pd.to_numeric(primary['primary_surplus'], errors='coerce')
-# drop missing 
-primary = primary.dropna(subset=['primary_surplus'])
+# Federal primary balance, BEA NIPA (SAAR, $bn): current receipts excluding interest
+# receipts, minus current expenditures excluding interest payments.
+# (Replaces data/raw/primary_surplus_bea.csv, which ran ~4pp of GDP below the federal
+# primary balance in every year and so was not a federal primary balance.)
+fed_receipts = get_fred_series('FGRECPT', 'receipts')
+fed_int_rec  = get_fred_series('B094RC1Q027SBEA', 'int_received')
+fed_expend   = get_fred_series('FGEXPND', 'expenditures')
+fed_int_paid = get_fred_series('A091RC1Q027SBEA', 'int_paid')
+primary = (fed_receipts.merge(fed_int_rec, on='date')
+                       .merge(fed_expend, on='date')
+                       .merge(fed_int_paid, on='date'))
+primary['primary_surplus'] = ((primary['receipts'] - primary['int_received'])
+                              - (primary['expenditures'] - primary['int_paid']))
+primary = primary[['date', 'primary_surplus']].dropna()
 print(f"Primary surplus data from {primary['date'].min()} to {primary['date'].max()}")
 
 df = pd.merge(term_prem, rgdp, on='date', how='left')
@@ -440,7 +436,7 @@ for var in ['acmtp10', 'real_gdp', 'nominal_gdp', 'potential_gdp', 'debt_gdp', '
     df[var] = df[var].astype(float)
 
 df['output_gap'] = ((df['real_gdp'] - df['potential_gdp']) / df['potential_gdp']) * 100.0
-df['primary_def_gdp'] = (df['primary_surplus'] / df['nominal_gdp']) * 100.0
+df['primary_def_gdp'] = (df['primary_surplus'] / df['nominal_gdp']) * 100.0  # both SAAR $bn
 
 df.rename(
     columns = {
@@ -479,7 +475,7 @@ base_fd['d_r']        = base_fd['ACMTP10_Q'].diff()      # Δy_t
 base_fd['d_b_lag']    = base_fd['b_lag'].diff()          # Δb_{t-1}
 base_fd['d_b_lag2']   = base_fd['d_b_lag'].shift(1)      # Δb_{t-2}
 base_fd['d_gap']      = base_fd['output_gap'].diff()
-base_fd['d_primary']  = base_fd['primary_lag'].diff()
+base_fd['d_primary']  = base_fd['primary_lag'].diff()    # Δs_{t-1}
 base_fd['d_r_lag']    = base_fd['d_r'].shift(1)          # Δy_{t-1}
 
 base_fd = base_fd.dropna()
@@ -520,6 +516,25 @@ print("=== RESULTS WITH FIRST DIFFERENCES (structurally aligned) ===")
 report(res_full_fd, "Full")
 report(res_post_fd, "Post-GFC")
 report(res_pre_fd,  "Pre-GFC")
+
+# The paper's equation imposes δ = -β_r ρ on the Δb_{t-2} coefficient; we estimate it unrestricted
+# by OLS. Test the restriction (delta method, HAC covariance) and re-estimate with it imposed (NLS).
+def restriction_checks(m, df):
+    b, r, dl = m.params['d_b_lag'], m.params['d_r_lag'], m.params['d_b_lag2']
+    keys = ['d_b_lag', 'd_r_lag', 'd_b_lag2']
+    V = m.cov_params().loc[keys, keys].values
+    grad = np.array([r, b, 1.0])
+    wald = (dl + b * r) ** 2 / (grad @ V @ grad)
+    p = 1 - stats.chi2.cdf(wald, df=1)
+    def resid(th):
+        c0, bb, rr, g1, g2 = th
+        return df['d_r'] - (c0 + bb * (df['d_b_lag'] - rr * df['d_b_lag2']) + rr * df['d_r_lag']
+                            + g1 * df['d_gap'] + g2 * df['d_primary'])
+    nls = optimize.least_squares(resid, x0=[0.0, b, r, 0.0, 0.0]).x
+    print(f"Restriction δ = -β_r ρ: Wald χ² = {wald:.2f} (p = {p:.2f}); "
+          f"restricted NLS: β_r = {nls[1]:.4f}, ρ = {nls[2]:.3f}")
+
+restriction_checks(res_full_fd, full_fd)
 
 # LaTeX table
 from statsmodels.iolib.summary2 import summary_col
